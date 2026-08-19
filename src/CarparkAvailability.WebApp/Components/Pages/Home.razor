@@ -1,28 +1,302 @@
 @page "/"
+@rendermode InteractiveServer
+@inject CarparkApiClient ApiClient
+@inject IJSRuntime JS
 
 <PageTitle>Smart Parking Navigator</PageTitle>
 
-<section class="hero">
-    <p class="eyebrow">Workshop starter</p>
-    <h1>Find a suitable HDB car park near your destination.</h1>
-    <p>
-        The Aspire application is running. Use the workshop guides to design and
-        implement destination search, live availability, filters, and map-based
-        results.
-    </p>
+<section class="page-shell">
+    <section class="hero-card">
+        <p class="eyebrow">Live HDB availability</p>
+        <h1>Find nearby HDB parking with live lot counts.</h1>
+        <p class="hero-copy">Destination lookup uses a built-in Singapore landmark dictionary with fuzzy matching. If nothing matches, the search falls back to central Singapore.</p>
+
+        <form class="search-form" @onsubmit="HandleSearchAsync" @onsubmit:preventDefault>
+            <label>
+                <span>Destination</span>
+                <input @bind="_destination" placeholder="Try Bugis, Tampines, Orchard..." />
+            </label>
+            <button type="submit" disabled="@_isLoading">@(_isLoading ? "Searching..." : "Search")</button>
+        </form>
+
+        <div class="filter-panel">
+            <label>
+                <span>Vehicle type</span>
+                <select @bind="_vehicleType">
+                    <option value="">All</option>
+                    <option value="C">Cars</option>
+                    <option value="H">Heavy vehicles</option>
+                    <option value="Y">Motorcycles</option>
+                    <option value="S">Motorcycles with side car</option>
+                </select>
+            </label>
+            <label class="checkbox"><input type="checkbox" @bind="_hasAvailableLots" /> Available lots only</label>
+            <label class="checkbox"><input type="checkbox" @bind="_hasFreeParking" /> Free parking</label>
+            <label class="checkbox"><input type="checkbox" @bind="_hasNightParking" /> Night parking</label>
+        </div>
+
+        <p class="search-meta">Showing results around <strong>@_matchedLandmark</strong> (@_currentLat.ToString("0.0000"), @_currentLon.ToString("0.0000")).</p>
+    </section>
+
+    @if (!string.IsNullOrWhiteSpace(_errorMessage))
+    {
+        <section class="alert error">@_errorMessage</section>
+    }
+    else if (_searchResponse?.DataStatus.Freshness is "stale" or "unavailable")
+    {
+        <section class="alert warning">Live availability data is @_searchResponse.DataStatus.Freshness. Results may be based on cached or missing data.</section>
+    }
+
+    <section class="content-grid">
+        <div class="map-card">
+            <div id="carpark-map" class="map-surface"></div>
+            <p class="map-note">Map tiles from OpenStreetMap via Leaflet.js.</p>
+        </div>
+
+        <div class="results-panel">
+            <div class="results-header">
+                <h2>Nearby carparks</h2>
+                <span>@(_searchResponse?.Total ?? 0) result(s)</span>
+            </div>
+
+            @if (_isLoading)
+            {
+                <div class="state-card">Loading nearby carparks…</div>
+            }
+            else if (_searchResponse is null)
+            {
+                <div class="state-card">Run a search to load nearby HDB carparks.</div>
+            }
+            else if (_searchResponse.Total == 0)
+            {
+                <div class="state-card">No carparks matched the current destination and filters.</div>
+            }
+            else
+            {
+                @foreach (CarparkResult carpark in _searchResponse.Items)
+                {
+                    <article class="result-card">
+                        <div class="result-topline">
+                            <div>
+                                <h3>@carpark.CarparkNo</h3>
+                                <p>@carpark.Address</p>
+                            </div>
+                            <span class="freshness @carpark.Availability.Freshness">@FreshnessIcon(carpark.Availability.Freshness) @carpark.Availability.Freshness</span>
+                        </div>
+
+                        <dl class="facts-grid">
+                            <div>
+                                <dt>Distance</dt>
+                                <dd>@FormatDistance(carpark.DistanceMetres)</dd>
+                            </div>
+                            <div>
+                                <dt>Free parking</dt>
+                                <dd>@carpark.FreeParking</dd>
+                            </div>
+                            <div>
+                                <dt>Night parking</dt>
+                                <dd>@carpark.NightParking</dd>
+                            </div>
+                            <div>
+                                <dt>Available lots</dt>
+                                <dd>@FormatLots(carpark.Availability.Lots)</dd>
+                            </div>
+                        </dl>
+
+                        <details>
+                            <summary>See details</summary>
+                            <ul class="detail-list">
+                                <li><strong>Type:</strong> @carpark.CarparkType</li>
+                                <li><strong>Parking system:</strong> @carpark.ParkingSystem</li>
+                                <li><strong>Short-term parking:</strong> @carpark.ShortTermParking</li>
+                                <li><strong>Decks:</strong> @(carpark.CarparkDecks?.ToString() ?? "n/a")</li>
+                                <li><strong>Gantry height:</strong> @(carpark.GantryHeight?.ToString("0.0") ?? "n/a")</li>
+                                <li><strong>Basement:</strong> @(carpark.IsBasement ? "Yes" : "No")</li>
+                                <li><strong>Coordinates:</strong> @carpark.Latitude.ToString("0.00000"), @carpark.Longitude.ToString("0.00000")</li>
+                                <li><strong>Availability timestamp:</strong> @(carpark.Availability.Timestamp?.ToLocalTime().ToString("dd MMM yyyy HH:mm:ss zzz") ?? "n/a")</li>
+                            </ul>
+                        </details>
+                    </article>
+                }
+            }
+        </div>
+    </section>
 </section>
 
-<section class="starter-grid" aria-label="Starter application status">
-    <article>
-        <h2>Frontend</h2>
-        <p>The Blazor Web App is ready for implementation.</p>
-    </article>
-    <article>
-        <h2>Backend</h2>
-        <p>ASP.NET Core, health endpoints, and the HDB dataset are wired.</p>
-    </article>
-    <article>
-        <h2>Orchestration</h2>
-        <p>.NET Aspire runs both projects and supplies API credentials.</p>
-    </article>
-</section>
+@code {
+    private static readonly Dictionary<string, (double Lat, double Lon)> Landmarks = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["tampines"] = (1.3530, 103.9445),
+        ["toa payoh"] = (1.3347, 103.8466),
+        ["bugis"] = (1.3010, 103.8556),
+        ["orchard"] = (1.3048, 103.8318),
+        ["jurong east"] = (1.3329, 103.7436),
+        ["bedok"] = (1.3236, 103.9273),
+        ["ang mo kio"] = (1.3691, 103.8454),
+        ["clementi"] = (1.3152, 103.7649),
+        ["bishan"] = (1.3526, 103.8352),
+        ["woodlands"] = (1.4382, 103.7890),
+        ["yishun"] = (1.4304, 103.8354),
+        ["punggol"] = (1.4044, 103.9022),
+        ["sengkang"] = (1.3868, 103.8914),
+        ["hougang"] = (1.3612, 103.8863),
+        ["pasir ris"] = (1.3721, 103.9494),
+        ["raffles place"] = (1.2837, 103.8518),
+        ["marina bay"] = (1.2762, 103.8558),
+        ["tiong bahru"] = (1.2854, 103.8270),
+        ["queenstown"] = (1.2942, 103.7861),
+        ["serangoon"] = (1.3554, 103.8679)
+    };
+
+    private string _destination = "Bugis";
+    private string _matchedLandmark = "Bugis";
+    private string _vehicleType = string.Empty;
+    private bool _hasAvailableLots = true;
+    private bool _hasFreeParking;
+    private bool _hasNightParking;
+    private bool _isLoading;
+    private bool _mapInitialized;
+    private bool _pendingMapRefresh;
+    private string? _errorMessage;
+    private double _currentLat = 1.3010;
+    private double _currentLon = 103.8556;
+    private CarparkSearchResponse? _searchResponse;
+
+    protected override async Task OnInitializedAsync()
+    {
+        await SearchAsync();
+    }
+
+    protected override async Task OnAfterRenderAsync(bool firstRender)
+    {
+        if (firstRender || _pendingMapRefresh)
+        {
+            await JS.InvokeVoidAsync("mapFunctions.initMap", "carpark-map", _currentLat, _currentLon);
+            CarparkResult[] items = _searchResponse?.Items?.ToArray() ?? [];
+            await JS.InvokeVoidAsync("mapFunctions.updateMarkers", items.Select(item => new
+            {
+                item.CarparkNo,
+                item.Address,
+                item.Latitude,
+                item.Longitude,
+                item.DistanceMetres,
+                Freshness = item.Availability.Freshness,
+                AvailableLots = item.Availability.Lots.Sum(lot => lot.AvailableLots)
+            }).ToArray());
+
+            _mapInitialized = true;
+            _pendingMapRefresh = false;
+        }
+    }
+
+    private Task HandleSearchAsync() => SearchAsync();
+
+    private async Task SearchAsync()
+    {
+        _isLoading = true;
+        _errorMessage = null;
+        StateHasChanged();
+
+        try
+        {
+            var geocodeResult = Geocode(_destination);
+            _currentLat = geocodeResult.Coordinates.Lat;
+            _currentLon = geocodeResult.Coordinates.Lon;
+            _matchedLandmark = geocodeResult.Landmark;
+
+            _searchResponse = await ApiClient.SearchNearbyAsync(
+                new CarparkSearchQuery(
+                    _currentLat,
+                    _currentLon,
+                    RadiusMetres: 800,
+                    VehicleType: string.IsNullOrWhiteSpace(_vehicleType) ? null : _vehicleType,
+                    HasAvailableLots: _hasAvailableLots,
+                    HasFreeParking: _hasFreeParking,
+                    HasNightParking: _hasNightParking));
+
+            _pendingMapRefresh = true;
+        }
+        catch (Exception)
+        {
+            _errorMessage = "The API is currently unavailable. Please try again shortly.";
+            _searchResponse = null;
+            _pendingMapRefresh = _mapInitialized;
+        }
+        finally
+        {
+            _isLoading = false;
+        }
+    }
+
+    private static string FormatDistance(double? distanceMetres)
+        => distanceMetres is null ? "n/a" : $"{distanceMetres.Value:0} m";
+
+    private static string FormatLots(IReadOnlyList<CarparkLotAvailability> lots)
+        => lots.Count == 0 ? "No live data" : string.Join(", ", lots.Select(lot => $"{lot.LotType}: {lot.AvailableLots}/{lot.TotalLots}"));
+
+    private static string FreshnessIcon(string freshness)
+        => freshness switch
+        {
+            "fresh" => "🟢",
+            "stale" => "🟡",
+            _ => "🔴"
+        };
+
+    private static ((double Lat, double Lon) Coordinates, string Landmark) Geocode(string destination)
+    {
+        string normalized = Normalize(destination);
+        if (string.IsNullOrWhiteSpace(normalized))
+        {
+            return ((1.3521, 103.8198), "Singapore centre (fallback)");
+        }
+
+        string? bestMatch = null;
+        double bestScore = 0;
+
+        foreach ((string landmark, (double lat, double lon) coords) in Landmarks)
+        {
+            string candidate = Normalize(landmark);
+            double score = Score(normalized, candidate);
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestMatch = landmark;
+            }
+        }
+
+        if (bestMatch is not null && bestScore >= 0.45)
+        {
+            return ((Landmarks[bestMatch].Lat, Landmarks[bestMatch].Lon), bestMatch);
+        }
+
+        return ((1.3521, 103.8198), "Singapore centre (fallback)");
+    }
+
+    private static string Normalize(string value)
+    {
+        return new string(value
+            .ToLowerInvariant()
+            .Where(character => char.IsLetterOrDigit(character) || char.IsWhiteSpace(character))
+            .ToArray())
+            .Trim();
+    }
+
+    private static double Score(string input, string candidate)
+    {
+        if (input.Contains(candidate, StringComparison.Ordinal) || candidate.Contains(input, StringComparison.Ordinal))
+        {
+            return 1;
+        }
+
+        HashSet<string> inputTokens = input.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToHashSet(StringComparer.Ordinal);
+        HashSet<string> candidateTokens = candidate.Split(' ', StringSplitOptions.RemoveEmptyEntries).ToHashSet(StringComparer.Ordinal);
+        int overlap = inputTokens.Count(token => candidateTokens.Contains(token));
+        int total = Math.Max(inputTokens.Count, candidateTokens.Count);
+        if (total == 0)
+        {
+            return 0;
+        }
+
+        return (double)overlap / total;
+    }
+}
